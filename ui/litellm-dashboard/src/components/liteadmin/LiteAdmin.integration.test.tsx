@@ -9,7 +9,7 @@ import userEvent from "@testing-library/user-event";
 import { useEffect, type ComponentType } from "react";
 import SidebarAccountMenu from "@/components/SidebarAccountMenu/SidebarAccountMenu";
 import UserDropdown from "@/components/Navbar/UserDropdown/UserDropdown";
-import LiteAdmin, { LiteAdminFrame } from "./LiteAdmin";
+import LiteAdmin, { LiteAdminFrame, LiteAdminHome } from "./LiteAdmin";
 import { MAX_INPUT_LENGTH } from "./agent";
 import type { ModelGroup } from "@/components/llm_calls/fetch_models";
 
@@ -98,9 +98,9 @@ function Page() {
   return null;
 }
 
-function renderWidget(Menu?: ComponentType<{ onLogout: () => void }>) {
+function renderWidget(Menu?: ComponentType<{ onLogout: () => void }>, showHome = false) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
-  const tree = () => (
+  const tree = (home = showHome) => (
     <QueryClientProvider client={client}>
       <Toaster />
       <AuthProvider>
@@ -108,13 +108,14 @@ function renderWidget(Menu?: ComponentType<{ onLogout: () => void }>) {
         {Menu && <Menu onLogout={() => undefined} />}
         <LiteAdminFrame>
           <Page />
+          {home && <LiteAdminHome />}
           <LiteAdmin />
         </LiteAdminFrame>
       </AuthProvider>
     </QueryClientProvider>
   );
   const view = render(tree());
-  return { ...view, refresh: () => view.rerender(tree()), client };
+  return { ...view, refresh: (home = showHome) => view.rerender(tree(home)), client };
 }
 
 interface GatewayOptions {
@@ -202,13 +203,124 @@ afterEach(() => {
 });
 
 describe("LiteAdmin in the gateway", () => {
+  it.each(["keyboard", "click"])("continues one conversation from Home via %s and the dock", async (method) => {
+    const requests = gateway([answer("First reply."), answer("Second reply."), answer("Third reply.")]);
+    renderWidget(undefined, true);
+    const home = await screen.findByRole("region", { name: "Ask LiteAdmin" });
+    await selectModel();
+    const input = within(home).getByPlaceholderText("Ask LiteAdmin…");
+    fireEvent.change(input, { target: { value: "First question" } });
+    if (method === "keyboard") fireEvent.keyDown(input, { key: "Enter" });
+    else fireEvent.click(within(home).getByRole("button", { name: "Send message" }));
+    expect(await screen.findByText("First reply.")).toBeInTheDocument();
+    expect(home).not.toBeVisible();
+    expect(screen.getAllByRole("complementary", { name: "LiteAdmin" })).toHaveLength(1);
+    expect(requests.filter((request) => request.url.endsWith("/chat/completions"))).toHaveLength(1);
+    send("Second question");
+    expect(await screen.findByText("Second reply.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close LiteAdmin" }));
+    expect(home).toBeVisible();
+    send("Third question");
+    expect(await screen.findByText("Third reply.")).toBeInTheDocument();
+    const completions = requests.filter((request) => request.url.endsWith("/chat/completions"));
+    expect(completions).toHaveLength(3);
+    expect(completions[2].body.messages).toEqual([
+      { role: "system", content: expect.any(String) },
+      { role: "user", content: "First question" },
+      { role: "assistant", content: "First reply." },
+      { role: "user", content: "Second question" },
+      { role: "assistant", content: "Second reply." },
+      { role: "user", content: "Third question" },
+    ]);
+  });
+
+  it("preserves the draft and chosen model when opening, closing and leaving Home", async () => {
+    const requests = gateway([answer("Draft received.")], {
+      models: [
+        { model_group: "claude-sonnet-5-5", mode: "chat" },
+        { model_group: "chat-model", mode: "chat" },
+      ],
+    });
+    const view = renderWidget(undefined, true);
+    await selectModel();
+    fireEvent.change(screen.getByPlaceholderText("Ask LiteAdmin…"), { target: { value: "Keep this draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "LiteAdmin" }));
+    expect(screen.getByPlaceholderText("Ask LiteAdmin…")).toHaveValue("Keep this draft");
+    fireEvent.click(screen.getByRole("button", { name: "Close LiteAdmin" }));
+    const home = screen.getByRole("region", { name: "Ask LiteAdmin" });
+    expect(within(home).getByPlaceholderText("Ask LiteAdmin…")).toHaveValue("Keep this draft");
+    view.refresh(false);
+    expect(home).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "LiteAdmin" }));
+    expect(screen.getByPlaceholderText("Ask LiteAdmin…")).toHaveValue("Keep this draft");
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    expect(await screen.findByText("Draft received.")).toBeInTheDocument();
+    const completion = requests.find((request) => request.url.endsWith("/chat/completions"));
+    expect(completion?.body.model).toBe("chat-model");
+    expect(completion?.body.messages).toContainEqual({ role: "user", content: "Keep this draft" });
+  });
+
+  it("keeps Home drafts unsent without a model or with empty or oversized input", async () => {
+    const options: GatewayOptions = { models: [] };
+    const requests = gateway([], options);
+    const { client } = renderWidget(undefined, true);
+    const home = await screen.findByRole("region", { name: "Ask LiteAdmin" });
+    expect(await within(home).findByText("Add a chat model to your gateway to use LiteAdmin.")).toBeInTheDocument();
+    expect(within(home).getByPlaceholderText("Ask LiteAdmin…")).toBeDisabled();
+    expect(within(home).getByRole("button", { name: "Send message" })).toBeDisabled();
+    options.models = [{ model_group: "chat-model", mode: "chat" }];
+    await act(async () => client.invalidateQueries({ queryKey: ["liteadmin-models"] }));
+    await selectModel();
+    for (const text of ["   ", "x".repeat(MAX_INPUT_LENGTH + 1)]) {
+      const input = within(home).getByPlaceholderText("Ask LiteAdmin…");
+      fireEvent.change(input, { target: { value: text } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      const submit = within(home).getByRole("button", { name: "Send message" });
+      expect(submit).toBeDisabled();
+      fireEvent.click(submit);
+      expect(input).toHaveValue(text);
+    }
+    expect(home).toBeVisible();
+    expect(within(home).getByRole("alert")).toHaveTextContent("8,000 characters");
+    expect(screen.queryByRole("complementary", { name: "LiteAdmin" })).not.toBeInTheDocument();
+    expect(requests.filter((request) => request.url.endsWith("/chat/completions"))).toHaveLength(0);
+  });
+
+  it("shows destination consent in Home and discards its draft when the destination changes", async () => {
+    const settings = { target: EXTERNAL_INFERENCE, status: 200 };
+    const settingsReady = deferred<void>();
+    const requests = gateway([], {
+      settings: async () => {
+        await settingsReady.promise;
+        return json({ PROXY_BASE_URL: MANAGEMENT, LITELLM_UI_API_DOC_BASE_URL: settings.target });
+      },
+    });
+    const { client } = renderWidget(undefined, true);
+    const home = await screen.findByRole("region", { name: "Ask LiteAdmin" });
+    expect(await within(home).findByLabelText("Loading gateway settings")).toBeInTheDocument();
+    await act(async () => settingsReady.resolve());
+    const consent = await within(home).findByRole("button", { name: "Use configured gateway" });
+    expect(within(home).getByText(EXTERNAL_INFERENCE)).toBeInTheDocument();
+    expect(within(home).queryByPlaceholderText("Ask LiteAdmin…")).not.toBeInTheDocument();
+    fireEvent.click(consent);
+    await selectModel();
+    fireEvent.change(within(home).getByPlaceholderText("Ask LiteAdmin…"), { target: { value: "Old gateway draft" } });
+    settings.target = `${EXTERNAL_INFERENCE}/changed`;
+    await act(async () => client.invalidateQueries({ queryKey: ["proxySettings"] }));
+    fireEvent.click(await within(home).findByRole("button", { name: "Use configured gateway" }));
+    await selectModel();
+    expect(within(home).getByPlaceholderText("Ask LiteAdmin…")).toHaveValue("");
+    expect(home).toBeVisible();
+    expect(requests.some((request) => request.url.endsWith("/chat/completions"))).toBe(false);
+  });
+
   it.each([
     ["sidebar", SidebarAccountMenu],
     ["navbar", UserDropdown],
   ] as const)("persists Hide LiteAdmin only for enterprise users in the %s account menu", async (_name, Menu) => {
     gateway([]);
     const user = userEvent.setup();
-    const view = renderWidget(Menu);
+    const view = renderWidget(Menu, true);
     await screen.findByRole("button", { name: "LiteAdmin" });
     await user.click(screen.getByRole("button", { name: /account menu/i }));
     const toggle = await screen.findByRole("switch", { name: "Toggle hide LiteAdmin" });
@@ -216,9 +328,10 @@ describe("LiteAdmin in the gateway", () => {
     await user.click(toggle);
     expect(toggle).toBeChecked();
     expect(screen.queryByRole("button", { name: "LiteAdmin" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Ask LiteAdmin", hidden: true })).not.toBeInTheDocument();
 
     view.unmount();
-    const restored = renderWidget(Menu);
+    const restored = renderWidget(Menu, true);
     await screen.findByText("Session ready");
     await waitFor(() => expect(restored.client.isFetching()).toBe(0));
     expect(screen.queryByRole("button", { name: "LiteAdmin" })).not.toBeInTheDocument();
@@ -227,6 +340,7 @@ describe("LiteAdmin in the gateway", () => {
     expect(savedToggle).toBeChecked();
     await user.click(savedToggle);
     expect(await screen.findByRole("button", { name: "LiteAdmin" })).toBeInTheDocument();
+    expect(await screen.findByRole("region", { name: "Ask LiteAdmin" })).toBeVisible();
 
     for (const premiumUser of [false, null, undefined, "true"]) {
       session("proxy_admin", "first-admin", { premium_user: premiumUser });
@@ -241,10 +355,11 @@ describe("LiteAdmin in the gateway", () => {
     async (premiumUser) => {
       session("proxy_admin", "first-admin", { premium_user: premiumUser });
       const requests = gateway([]);
-      const { client } = renderWidget();
+      const { client } = renderWidget(undefined, true);
       await screen.findByText("Session ready");
       await waitFor(() => expect(client.isFetching()).toBe(0));
       expect(screen.queryByRole("button", { name: "LiteAdmin" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("region", { name: "Ask LiteAdmin", hidden: true })).not.toBeInTheDocument();
       for (const modifiers of [{ metaKey: true }, { ctrlKey: true }]) {
         expect(fireEvent.keyDown(document, { key: "j", ...modifiers })).toBe(true);
         expect(screen.queryByRole("complementary", { name: "LiteAdmin" })).not.toBeInTheDocument();
@@ -387,10 +502,11 @@ describe("LiteAdmin in the gateway", () => {
     async (role) => {
       session(role);
       const requests = gateway([]);
-      const { client } = renderWidget();
+      const { client } = renderWidget(undefined, true);
       await screen.findByText("Session ready");
       await waitFor(() => expect(client.isFetching()).toBe(0));
       expect(screen.queryByRole("button", { name: "LiteAdmin" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("region", { name: "Ask LiteAdmin", hidden: true })).not.toBeInTheDocument();
       expect(requests.every((request) => request.url.endsWith("/litellm-ui-config"))).toBe(true);
     },
   );
@@ -641,9 +757,9 @@ describe("LiteAdmin in the gateway", () => {
 
   it("blocks inference when settings cannot be loaded", async () => {
     const requests = gateway([], { settings: { target: INFERENCE, status: 503 } });
-    renderWidget();
-    fireEvent.click(await screen.findByRole("button", { name: "LiteAdmin" }));
-    expect(await screen.findByText("Could not load gateway settings.")).toBeInTheDocument();
+    renderWidget(undefined, true);
+    const home = await screen.findByRole("region", { name: "Ask LiteAdmin" });
+    expect(await within(home).findByText("Could not load gateway settings.")).toBeInTheDocument();
     expect(requests.some((request) => request.url.endsWith("/chat/completions"))).toBe(false);
   });
 

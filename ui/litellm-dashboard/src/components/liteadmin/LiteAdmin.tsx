@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import { createPortal } from "react-dom";
 import { useQuery } from "@tanstack/react-query";
 import { RotateCcw, Sparkles, X } from "lucide-react";
 import useAuthorized from "@/app/(dashboard)/hooks/useAuthorized";
@@ -23,7 +24,13 @@ import { LiteAdminConversation } from "./LiteAdminConversation";
 import { useLiteAdmin, type LiteAdminSession } from "./useLiteAdmin";
 
 type ManagementSession = Omit<LiteAdminSession, "inferenceBaseUrl">;
-type LiteAdminState = { open: boolean; toggle: () => void };
+type LiteAdminState = {
+  open: boolean;
+  toggle: () => void;
+  show: () => void;
+  homeContainer: HTMLDivElement | null;
+  setHomeContainer: (container: HTMLDivElement | null) => void;
+};
 
 const LiteAdminContext = createContext<LiteAdminState | null>(null);
 
@@ -43,12 +50,16 @@ export function LiteAdminFrame({ children }: { children: ReactNode }) {
   const configured = useLiteAdminSession();
   const sessionKey = configured?.key ?? null;
   const [open, setOpen] = useState(false);
+  const [homeContainer, setHomeContainer] = useState<HTMLDivElement | null>(null);
   const [openedSession, setOpenedSession] = useState(sessionKey);
   if (openedSession !== sessionKey) {
     setOpenedSession(sessionKey);
     setOpen(false);
   }
   const toggle = () => setOpen((current) => !current);
+  const show = () => {
+    if (!open) setOpen(true);
+  };
   useEffect(() => {
     if (sessionKey === null) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -62,12 +73,35 @@ export function LiteAdminFrame({ children }: { children: ReactNode }) {
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [sessionKey]);
   return (
-    <LiteAdminContext.Provider value={configured ? { open, toggle } : null}>
+    <LiteAdminContext.Provider value={configured ? { open, toggle, show, homeContainer, setHomeContainer } : null}>
       {children}
       {configured && (
         <DockedPanel key={configured.key} session={configured.session} open={open} close={() => setOpen(false)} />
       )}
     </LiteAdminContext.Provider>
+  );
+}
+
+export function LiteAdminHome() {
+  const state = useContext(LiteAdminContext);
+  if (!state) return null;
+  const { open, show, setHomeContainer } = state;
+  return (
+    <section aria-label="Ask LiteAdmin" hidden={open} className="rounded-2xl border bg-card">
+      <div className="flex items-center justify-between gap-3 p-4">
+        <div>
+          <h2 className="flex items-center gap-2 text-sm font-medium">
+            <Sparkles className="size-4 text-info" />
+            LiteAdmin
+          </h2>
+          <p className="mt-1 text-sm text-muted-foreground">Ask about your gateway. Review changes in chat.</p>
+        </div>
+        <Button variant="ghost" size="sm" onClick={show}>
+          Open chat
+        </Button>
+      </div>
+      <div ref={setHomeContainer} />
+    </section>
   );
 }
 
@@ -132,36 +166,40 @@ function Destination({
     return <LiteAdminChat session={{ ...session, inferenceBaseUrl: target.baseUrl }} open={open} close={close} />;
   }
   return (
-    <Panel open={open}>
+    <Panel
+      open={open}
+      composer={
+        <div className="p-4">
+          {loading && <Skeleton className="h-24" aria-label="Loading gateway settings" />}
+          {!loading && !target?.baseUrl && (
+            <Alert variant="destructive">
+              <AlertDescription>{target?.error || "Could not load gateway settings."}</AlertDescription>
+              <Button variant="link" onClick={retry}>
+                Retry
+              </Button>
+            </Alert>
+          )}
+          {!loading && target?.baseUrl && (
+            <Card size="sm">
+              <CardHeader>
+                <CardTitle>Connect to the configured gateway</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <p className="break-all font-mono text-xs">{target.baseUrl}</p>
+                <p className="text-muted-foreground">
+                  This gateway uses a different address. LiteAdmin will send your existing session credential to the
+                  address shown above.
+                </p>
+              </CardContent>
+              <CardFooter>
+                <Button onClick={() => setApproved(true)}>Use configured gateway</Button>
+              </CardFooter>
+            </Card>
+          )}
+        </div>
+      }
+    >
       <PanelHeader close={close} />
-      <div className="p-4">
-        {loading && <Skeleton className="h-24" aria-label="Loading gateway settings" />}
-        {!loading && !target?.baseUrl && (
-          <Alert variant="destructive">
-            <AlertDescription>{target?.error || "Could not load gateway settings."}</AlertDescription>
-            <Button variant="link" onClick={retry}>
-              Retry
-            </Button>
-          </Alert>
-        )}
-        {!loading && target?.baseUrl && (
-          <Card size="sm">
-            <CardHeader>
-              <CardTitle>Connect to the configured gateway</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <p className="break-all font-mono text-xs">{target.baseUrl}</p>
-              <p className="text-muted-foreground">
-                This gateway uses a different address. LiteAdmin will send your existing session credential to the
-                address shown above.
-              </p>
-            </CardContent>
-            <CardFooter>
-              <Button onClick={() => setApproved(true)}>Use configured gateway</Button>
-            </CardFooter>
-          </Card>
-        )}
-      </div>
     </Panel>
   );
 }
@@ -170,12 +208,16 @@ function Destination({
 function Panel({
   open,
   initialFocus,
+  composer,
   children,
 }: {
   open: boolean;
   initialFocus?: RefObject<HTMLElement | null>;
+  composer: ReactNode;
   children: ReactNode;
 }) {
+  const state = useContext(LiteAdminContext);
+  const homeContainer = !open ? state?.homeContainer : null;
   const ref = useRef<HTMLElement>(null);
   useEffect(() => {
     const panel = ref.current;
@@ -196,11 +238,13 @@ function Panel({
       )}
     >
       {children}
+      {homeContainer ? createPortal(composer, homeContainer) : composer}
     </aside>
   );
 }
 
 function LiteAdminChat({ session, open, close }: { session: LiteAdminSession; open: boolean; close: () => void }) {
+  const state = useContext(LiteAdminContext);
   const chat = useLiteAdmin(session);
   const [input, setInput] = useState("");
   const [model, setModel] = useState<string | null>(null);
@@ -208,7 +252,7 @@ function LiteAdminChat({ session, open, close }: { session: LiteAdminSession; op
   const modelQuery = {
     queryKey: ["liteadmin-models", session.accessToken, session.managementBaseUrl],
     queryFn: () => fetchAvailableModels(session.accessToken),
-    enabled: open,
+    enabled: open || Boolean(state?.homeContainer),
     select: (available: ModelGroup[]) =>
       available.filter((item) => isModeCompatibleWithEndpoint(item.mode, EndpointType.CHAT)),
   };
@@ -221,11 +265,56 @@ function LiteAdminChat({ session, open, close }: { session: LiteAdminSession; op
   const submitDisabled = busy || models.isError || !hasValidInput;
   const send = () => {
     if (submitDisabled || !selectedModel) return;
+    state?.show();
     void chat.send(input, selectedModel);
     setInput("");
   };
+  const composer = (
+    <div className="space-y-3 border-t p-3">
+      {models.isPending ? (
+        <Skeleton className="h-8" aria-label="Loading models" />
+      ) : (
+        <SearchSelect
+          aria-label="LiteAdmin model"
+          options={(models.data ?? []).map((item) => ({ value: item.model_group, label: item.model_group }))}
+          value={selectedModel}
+          onValueChange={setModel}
+          placeholder="Choose a chat model"
+          disabled={busy}
+          allowClear={false}
+        />
+      )}
+      {models.isError && (
+        <Alert variant="destructive">
+          <AlertDescription>
+            Could not load models.{" "}
+            <Button variant="link" onClick={() => void models.refetch()}>
+              Retry
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
+      {models.isSuccess && models.data.length === 0 && (
+        <Alert role="status">
+          <AlertDescription>Add a chat model to your gateway to use LiteAdmin.</AlertDescription>
+        </Alert>
+      )}
+      {tooLong && <FieldError>Keep your message within {MAX_INPUT_LENGTH.toLocaleString()} characters.</FieldError>}
+      <ChatComposer
+        value={input}
+        onChange={setInput}
+        onSubmit={send}
+        onCancel={chat.phase === "applying" ? undefined : chat.stop}
+        placeholder="Ask LiteAdmin…"
+        disabled={busy || !selectedModel}
+        isLoading={busy}
+        submitDisabled={submitDisabled}
+      />
+      <p className="text-xs text-muted-foreground">Use a model you trust with your gateway data.</p>
+    </div>
+  );
   return (
-    <Panel open={open} initialFocus={chat.phase === "review" ? reviewRef : undefined}>
+    <Panel open={open} initialFocus={chat.phase === "review" ? reviewRef : undefined} composer={composer}>
       <PanelHeader close={close}>
         <Button
           variant="ghost"
@@ -248,48 +337,6 @@ function LiteAdminChat({ session, open, close }: { session: LiteAdminSession; op
         reviewRef={reviewRef}
         onAnswer={chat.answer}
       />
-      <div className="space-y-3 border-t p-3">
-        {models.isPending ? (
-          <Skeleton className="h-8" aria-label="Loading models" />
-        ) : (
-          <SearchSelect
-            aria-label="LiteAdmin model"
-            options={(models.data ?? []).map((item) => ({ value: item.model_group, label: item.model_group }))}
-            value={selectedModel}
-            onValueChange={setModel}
-            placeholder="Choose a chat model"
-            disabled={busy}
-            allowClear={false}
-          />
-        )}
-        {models.isError && (
-          <Alert variant="destructive">
-            <AlertDescription>
-              Could not load models.{" "}
-              <Button variant="link" onClick={() => void models.refetch()}>
-                Retry
-              </Button>
-            </AlertDescription>
-          </Alert>
-        )}
-        {models.isSuccess && models.data.length === 0 && (
-          <Alert role="status">
-            <AlertDescription>Add a chat model to your gateway to use LiteAdmin.</AlertDescription>
-          </Alert>
-        )}
-        {tooLong && <FieldError>Keep your message within {MAX_INPUT_LENGTH.toLocaleString()} characters.</FieldError>}
-        <ChatComposer
-          value={input}
-          onChange={setInput}
-          onSubmit={send}
-          onCancel={chat.phase === "applying" ? undefined : chat.stop}
-          placeholder="Ask LiteAdmin…"
-          disabled={busy || !selectedModel}
-          isLoading={busy}
-          submitDisabled={submitDisabled}
-        />
-        <p className="text-xs text-muted-foreground">Use a model you trust with your gateway data.</p>
-      </div>
     </Panel>
   );
 }
